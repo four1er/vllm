@@ -2,14 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    create_error_response,
+)
 from vllm.renderers.chat_utils import parse_chat_messages
+from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
 from vllm.tokenizers.registry import TokenizerRegistry
@@ -653,3 +659,71 @@ def test_deepseek_v4_request_tools_do_not_mutate_caller_messages():
     _tokenizer().apply_chat_template(messages, tools=_request_tools(), tokenize=False)
 
     assert messages == snapshot
+
+
+@pytest.mark.parametrize(
+    ("tools", "match"),
+    [
+        ([{"x": 1}], "function"),
+        ([{"function": "not_a_dict"}], "function"),
+        (["not_a_dict"], "function"),
+        ("not_a_list", "tools"),
+    ],
+)
+def test_deepseek_v4_malformed_message_tools_return_400_value_error(tools, match):
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "stub",
+            "messages": [
+                {"role": "developer", "content": "dev", "tools": tools},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+    )
+    renderer = DeepseekV4Renderer.__new__(DeepseekV4Renderer)
+    renderer.model_config = _model_config()
+    renderer.tokenizer = _tokenizer()
+    params = request.build_chat_params(None, "auto")
+    params.chat_template_kwargs["tokenize"] = False
+
+    with pytest.raises(ValueError, match=match) as exc_info:
+        renderer.render_messages(request.messages, params)
+
+    err = create_error_response(exc_info.value)
+    assert err.error.code == HTTPStatus.BAD_REQUEST
+    assert err.error.type == "BadRequestError"
+
+
+def test_deepseek_v4_request_level_malformed_tools_rejected_by_validation():
+    with pytest.raises(ValidationError) as exc_info:
+        ChatCompletionRequest.model_validate(
+            {
+                "model": "stub",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{"x": 1}],
+            }
+        )
+
+    assert any(
+        err["loc"] == ("tools", 0, "function") for err in exc_info.value.errors()
+    )
+
+
+def test_deepseek_v4_valid_developer_message_tools_render():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "stub",
+            "messages": [
+                {"role": "developer", "content": "dev", "tools": _request_tools()},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+    )
+    renderer = DeepseekV4Renderer.__new__(DeepseekV4Renderer)
+    renderer.model_config = _model_config()
+    renderer.tokenizer = _tokenizer()
+    params = request.build_chat_params(None, "auto")
+    params.chat_template_kwargs["tokenize"] = False
+
+    _, prompt = renderer.render_messages(request.messages, params)
+    assert '"name": "get_weather"' in prompt["prompt"]

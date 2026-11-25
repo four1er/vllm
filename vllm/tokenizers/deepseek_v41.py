@@ -55,6 +55,11 @@ def _normalize_messages(
             parts = []
             tool_references = []
             for block in content:
+                if not isinstance(block, dict):
+                    raise ValueError(
+                        "Invalid content part: expected a dict with a 'type' "
+                        f"field, got {type(block).__name__}"
+                    )
                 part_type = block.get("type")
                 if part_type in ("text", "input_text", "output_text"):
                     _reject_image_placeholder(block.get("text"))

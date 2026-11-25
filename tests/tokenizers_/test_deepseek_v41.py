@@ -4,16 +4,21 @@
 import asyncio
 import copy
 import json
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    create_error_response,
+)
 from vllm.renderers.chat_utils import BaseMultiModalItemTracker
-from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+from vllm.renderers.deepseek_v4 import DeepseekV4Renderer, DeepseekV41Renderer
 from vllm.renderers.params import ChatParams
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
@@ -582,3 +587,122 @@ def test_deepseek_v41_unknown_role_raises_value_error():
             [{"role": "SYSTEM", "content": "Hello"}],
             thinking_mode="chat",
         )
+
+
+def _v41_renderer() -> DeepseekV41Renderer:
+    renderer = DeepseekV41Renderer.__new__(DeepseekV41Renderer)
+    renderer.model_config = SimpleNamespace(
+        multimodal_config=None,
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+        enable_prompt_embeds=False,
+        is_multimodal_model=False,
+        hf_config=SimpleNamespace(),
+    )
+    renderer.tokenizer = get_deepseek_v41_tokenizer(FakeHfTokenizer())
+    return renderer
+
+
+_VALID_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get weather",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+
+@pytest.mark.parametrize("role", ["developer", "system"])
+@pytest.mark.parametrize(
+    ("tools", "match"),
+    [
+        ([{"x": 1}], "function"),
+        ([{"function": "not_a_dict"}], "function"),
+        (["not_a_dict"], "function"),
+        ("not_a_list", "tools"),
+    ],
+)
+def test_deepseek_v41_malformed_message_tools_return_400_value_error(
+    role, tools, match
+):
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "stub",
+            "messages": [
+                {"role": role, "content": "instructions", "tools": tools},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+    )
+    params = request.build_chat_params(None, "auto")
+    params.chat_template_kwargs["tokenize"] = False
+
+    with pytest.raises(ValueError, match=match) as exc_info:
+        _v41_renderer().render_messages(request.messages, params)
+
+    err = create_error_response(exc_info.value)
+    assert err.error.code == HTTPStatus.BAD_REQUEST
+    assert err.error.type == "BadRequestError"
+
+
+def test_deepseek_v41_bare_string_content_part_with_tools_returns_400_value_error():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "stub",
+            "messages": [
+                {
+                    "role": "developer",
+                    "content": ["hello"],
+                    "tools": [_VALID_TOOL],
+                },
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+    )
+    params = request.build_chat_params(None, "auto")
+    params.chat_template_kwargs["tokenize"] = False
+
+    with pytest.raises(ValueError, match="content part") as exc_info:
+        _v41_renderer().render_messages(request.messages, params)
+
+    err = create_error_response(exc_info.value)
+    assert err.error.code == HTTPStatus.BAD_REQUEST
+    assert err.error.type == "BadRequestError"
+
+
+def test_deepseek_v41_structured_text_part_with_developer_tools_renders():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "stub",
+            "messages": [
+                {
+                    "role": "developer",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "tools": [_VALID_TOOL],
+                },
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+    )
+    params = request.build_chat_params(None, "auto")
+    params.chat_template_kwargs["tokenize"] = False
+
+    _, prompt = _v41_renderer().render_messages(request.messages, params)
+    assert "<｜User｜>hello" in prompt["prompt"]
+    assert '"name": "get_weather"' in prompt["prompt"]
+
+
+def test_deepseek_v41_request_level_malformed_tools_rejected_by_validation():
+    with pytest.raises(ValidationError) as exc_info:
+        ChatCompletionRequest.model_validate(
+            {
+                "model": "stub",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{"x": 1}],
+            }
+        )
+
+    assert any(
+        err["loc"] == ("tools", 0, "function") for err in exc_info.value.errors()
+    )

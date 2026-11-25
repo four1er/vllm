@@ -64,7 +64,29 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    return [tool["function"] for tool in tools]
+    if not isinstance(tools, list):
+        raise ValueError(
+            f"Invalid 'tools': expected a list, got {type(tools).__name__}"
+        )
+    result = []
+    for idx, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValueError(
+                f"Invalid tool at index {idx}: expected a dict with a "
+                f"'function' dict, got {type(tool).__name__}"
+            )
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            if "function" not in tool:
+                raise ValueError(
+                    f"Invalid tool at index {idx}: missing required 'function' dict"
+                )
+            raise ValueError(
+                f"Invalid tool at index {idx}: 'function' must be a dict, "
+                f"got {type(function).__name__}"
+            )
+        result.append(function)
+    return result
 
 
 def tool_calls_from_openai_format(tool_calls):
